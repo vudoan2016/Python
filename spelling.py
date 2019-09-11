@@ -1,13 +1,13 @@
+import sys
 import requests
 import pandas as pd
 import re
 import random
-import shelve
-import time
-import os
 import logging
 import docx
 import PyPDF2
+import sqlite3
+from sqlite3 import Error
 import ipywidgets as widgets
 from IPython.display import display, HTML
 from IPython.core.interactiveshell import InteractiveShell
@@ -18,6 +18,8 @@ HTML('<style> .widget-hbox .widget-label { max-width:350ex; text-align:left} </s
 
 TODAY_WORD_COUNT = 10
 LOG_FILENAME = 'spelling.log'
+DBASE_FILE = 'word_db.db'
+EXCEL = 'SantaClaraSpellingList18-19.xlsx'
 
 book_urls = ['http://www.gutenberg.org/cache/epub/76/pg76.txt']
 spelling_bee_urls = ['http://www2.sharonherald.com/herald/nie/spellb/spelllist1.html',
@@ -28,27 +30,8 @@ InteractiveShell.ast_node_interactivity = "all"
 pd.set_option('display.max_columns', None)
 pd.set_option('display.expand_frame_repr', False)
 pd.set_option('max_colwidth', -1)
-#pd.set_option('max_colwidth', 1000)
+
 logging.basicConfig(filename=LOG_FILENAME, level=logging.DEBUG)
-
-class State:
-	def __init__(self, word_db, word):
-		self.word_db = word_db
-		self.word = word
-		self.c_box = widgets.Checkbox(False)
-
-	def action(self, *args):
-		if self.c_box.value:
-			lst = self.word_db[str(len(self.word[0]))]
-			lst.remove(self.word)
-			if lst:
-				self.word_db[str(len(self.word[0]))] = lst
-			else:
-				del(self.word_db[str(len(self.word[0]))])
-
-	def start(self):
-		display(HBox([self.c_box, Label(self.word[1])]))
-		self.c_box.observe(self.action, 'value')
 
 def extact_docx(file):
 	doc = docx.Document(file)
@@ -62,21 +45,6 @@ def extract_pdf(file):
 	pdf_reader = PyPDF2.PdfFileReader(obj)
 	page = pdf_reader.getPage(2)
 	print(page.extractText())
-
-def extract_excel(file):
-	df = pd.read_excel(file, sheet_name='Table 1')
-	return [(row['Unnamed: 0'], row['Unnamed: 1']) for index, row in df.iterrows()]
-
-def scrape_page(url, count):
-	page = requests.get(url)
-	soup = BeautifulSoup(page.text, 'html.parser')
-	table = soup.find_all('table')[1] # words are in 2nd table
-	words = []
-	for row in table.find_all('b'):
-		words.append((row.contents[0].lower(), row.next_sibling))
-		count += 1
-		#words.append(row.contents[0] for row in table.find_all('b'))
-	return words, count
 
 def get_book(url, count):
 	words = []
@@ -107,73 +75,143 @@ def get_book(url, count):
 				'''
 	return words, count
 
-# print(sorted(list(frequency.items()), key=lambda tup: tup[1], reverse=True)[:20])
-def analyze_book(book, word_bank):
-	for word_def in book:
-		if len(word_def[0]) in word_bank.keys() and word_def[0] not in word_bank:
-			word_bank[len(word_def[0])].append(word_def)
-		else:
-			word_bank[len(word_def[0])] = [word_def]
-	return word_bank
+class State:
+	def __init__(self, db_file, word):
+		self.db_file = db_file
+		self.word = word
+		self.c_box = widgets.Checkbox(False, description=word[0])
 
-def display_book_info(info, total):
+	def action(self, change):
+		if self.c_box.value:
+			sql = 'DELETE FROM words WHERE word=?'
+			try:
+				db_handle = db_connect(self.db_file)
+				curs = db_handle.cursor()
+				curs.execute(sql, (self.word[0],))
+				db_handle.commit()
+				db_handle.close()
+			except Error as e:
+				print(e)
+
+	def start(self):
+		display(HBox([self.c_box, Label(self.word[1])]))
+		self.c_box.observe(self.action, 'value')
+
+def extract_excel(file):
+	df = pd.read_excel(file, sheet_name='Table 1')
+	return [(row['Unnamed: 0'], row['Unnamed: 1']) for index, row in df.iterrows()]
+
+def scrape_pages(urls):
+	col = []
+	for url in spelling_bee_urls:
+		page = requests.get(url)
+		soup = BeautifulSoup(page.text, 'html.parser')
+		table = soup.find_all('table')[1] # words are in 2nd table
+		for row in table.find_all('b'):
+			col.append((row.contents[0].lower(), row.next_sibling))
+	return col
+
+# print(sorted(list(frequency.items()), key=lambda tup: tup[1], reverse=True)[:20])
+def analyze_collection(col, info, count, db):
+	for word in col:
+		if len(word[0]) in info.keys() and word[0] not in db.keys():
+			info[len(word[0])] += 1
+			count += 1
+		elif word[0] not in db.keys():
+			info[len(word[0])] = 1
+			count += 1
+
+	return info, count
+
+def store_collection(col, cache, db_handle):
+	for word in col:
+		if word[0] not in cache.keys():
+			cache[word[0]] = word[1]
+			db_insert_row(db_handle, word)
+
+			#shelve_db[word[0]] = word[1]
+	return cache
+
+def display_info(info, total):
 	summary = [total]
 	headers = ['Total']
-	for size, l in info.items():
-		summary.append(len(l))
+	for size, count in info.items():
+		summary.append(size)
 		headers.append(str(size)+'-letter')
-	display(pd.DataFrame([summary], columns=headers))
+	display(pd.DataFrame([summary], columns=headers).style.hide_index())
 
-def today_words(info):
-	today = []
-	for length in random.sample(info.keys(), TODAY_WORD_COUNT):
-		today.append(random.choice(info[length]))
-	return today
+def today_words(db):
+	return random.sample(db.items(), TODAY_WORD_COUNT)
 
-def spell(word_db, today):
+def spell(db_file, today):
 	for word in today:
-		c_box = State(word_db, word)
+		c_box = State(db_file, word)
 		c_box.start()
 
+def db_connect(db_file):
+	db_handle = None
+	try:
+		db_handle = sqlite3.connect(db_file)
+	except Error as e:
+		print(e)
+
+	return db_handle
+
+def db_table_create(db_handle):
+	try:
+		cursor = db_handle.cursor()
+		cursor.execute('CREATE TABLE IF NOT EXISTS words (word text, def text)')
+	except Error as e:
+		print(e)
+
+def db_insert_row(db_handle, word):
+	sql = 'INSERT INTO words(word, def) VALUES(?, ?)'
+	try:
+		c = db_handle.cursor()
+		c.execute(sql, word)
+	except Error as e:
+		print(e)
+	return c.lastrowid
+
+def db_load(db_handle):
+	try:
+		cursor = db_handle.cursor()
+		cursor.execute('SELECT * FROM words')
+	except Error as e:
+		print(e)
+	return cursor.fetchall()
+
 if __name__ == '__main__':
-	count = 0
-	word_bank = {}
+	db_handle = db_connect(DBASE_FILE)
+	if not db_handle:
+		sys.exit()
+
+	db_table_create(db_handle)
 
 	# Loading databases
-	if os.path.exists('word_dict.dat'):
-		word_db = shelve.open('word_dict')
-		start = time.time()
-		for key in word_db:
-			word_bank[int(key)] = []
-			for item in word_db[key]:
-				word_bank[int(key)].append(item)
-			count += len(word_db[key])
-		logging.debug('Loading database takes %d', time.time() - start)
+	col = db_load(db_handle)
+
+	count = 0
+	cache = {}
+	info = {}
+
+	if col:
+		info, count = analyze_collection(col, info, count, cache)
+		cache = dict(col)
 	else:
-		start = time.time()
 		# Scrape web pages if database doesn't exist
-		if not word_bank:
-			for url in spelling_bee_urls:
-				book, count = scrape_page(url, count)
-				word_bank = analyze_book(book, word_bank)
-		logging.debug('Scraping takes %d', time.time() - start)
+		col = scrape_pages(spelling_bee_urls)
+		info, count = analyze_collection(col, info, count, cache)
+		cache = store_collection(col, cache, db_handle)
 
-		book = extract_excel('SantaClaraSpellingList18-19.xlsx')
-		word_bank = analyze_book(book, word_bank)
-		count += len(book)
+		col = extract_excel(EXCEL)
+		info, count = analyze_collection(col, info, count, cache)
+		cache = store_collection(col, cache, db_handle)
 
-		'''
-		for url in book_urls:
-			book, count = get_book(url, count)
-			word_bank = analyze_book(book, word_bank)
-		'''
+	db_handle.commit()
+	db_handle.close()
 
-		word_db = shelve.open('word_dict')
-		for key in word_bank:
-			word_db[str(key)] = []
-			for item in word_bank[key]:
-				word_db[str(key)].append(item)
+	display_info(info, count)
+	today = today_words(cache)
+	spell(DBASE_FILE, today)
 
-	display_book_info(word_bank, count)
-	today = today_words(word_bank)
-	spell(word_db, today)
