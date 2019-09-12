@@ -4,8 +4,6 @@ import pandas as pd
 import re
 import random
 import logging
-import docx
-import PyPDF2
 import sqlite3
 from sqlite3 import Error
 import ipywidgets as widgets
@@ -16,11 +14,12 @@ from ipywidgets import HBox, Label
 
 HTML('<style> .widget-hbox .widget-label { max-width:350ex; text-align:left} </style>')
 
-TODAY_WORD_COUNT = 10
+SAMPLE_WORDS = 10
 LOG_FILENAME = 'spelling.log'
 DBASE_FILE = 'word_db.db'
-EXCEL = 'SantaClaraSpellingList18-19.xlsx'
-
+excel_files = ['spelling_bee_list_grade_6.xlsx',
+							 'SantaClaraSpellingList18-19.xlsx',
+							 '200 words.xlsx']
 book_urls = ['http://www.gutenberg.org/cache/epub/76/pg76.txt']
 spelling_bee_urls = ['http://www2.sharonherald.com/herald/nie/spellb/spelllist1.html',
 										 'http://www2.sharonherald.com/herald/nie/spellb/spelllist2.html',
@@ -32,19 +31,6 @@ pd.set_option('display.expand_frame_repr', False)
 pd.set_option('max_colwidth', -1)
 
 logging.basicConfig(filename=LOG_FILENAME, level=logging.DEBUG)
-
-def extact_docx(file):
-	doc = docx.Document(file)
-	full_txt = []
-	for pars in doc.paragraphs:
-		full_txt.append(pars.text)
-	return '\n'.join(full_txt)
-
-def extract_pdf(file):
-	obj = open(file, 'rb')
-	pdf_reader = PyPDF2.PdfFileReader(obj)
-	page = pdf_reader.getPage(2)
-	print(page.extractText())
 
 def get_book(url, count):
 	words = []
@@ -97,9 +83,17 @@ class State:
 		display(HBox([self.c_box, Label(self.word[1])]))
 		self.c_box.observe(self.action, 'value')
 
-def extract_excel(file):
-	df = pd.read_excel(file, sheet_name='Table 1')
-	return [(row['Unnamed: 0'], row['Unnamed: 1']) for index, row in df.iterrows()]
+def fetch_excels(files):
+	col = []
+	for f in files:
+		df = pd.read_excel(f, sheet_name='Table 1')
+		for index, row in df.iterrows():
+			if 'Unnamed: 1' in df:
+				col.append((row['Unnamed: 0'].split()[0].lower(), row['Unnamed: 1']))
+			else:
+				entry = row['Unnamed: 0'].replace('\n', '. ').split(':')
+				col.append((entry[0].split()[0], entry[1]))
+	return col
 
 def scrape_pages(urls):
 	col = []
@@ -112,41 +106,41 @@ def scrape_pages(urls):
 	return col
 
 # print(sorted(list(frequency.items()), key=lambda tup: tup[1], reverse=True)[:20])
-def analyze_collection(col, info, count, db):
+def analyze_collection(col, summary, count, cache):
 	for word in col:
-		if len(word[0]) in info.keys() and word[0] not in db.keys():
-			info[len(word[0])] += 1
+		if len(word[0]) in summary.keys() and word[0] not in cache.keys():
+			summary[len(word[0])] += 1
 			count += 1
-		elif word[0] not in db.keys():
-			info[len(word[0])] = 1
+		elif word[0] not in cache.keys():
+			summary[len(word[0])] = 1
 			count += 1
 
-	return info, count
+	return summary, count
 
+# Store the collection of word-defs in the cache & database
 def store_collection(col, cache, db_handle):
-	for word in col:
-		if word[0] not in cache.keys():
-			cache[word[0]] = word[1]
-			db_insert_row(db_handle, word)
+	for word_def in col:
+		if word_def[0] not in cache.keys():
+			cache[word_def[0]] = word_def[1]
+			db_insert_row(db_handle, word_def)
 
-			#shelve_db[word[0]] = word[1]
 	return cache
 
-def display_info(info, total):
-	summary = [total]
+def display_summary(summary, total):
+	counts = [total]
 	headers = ['Total']
-	for size, count in info.items():
-		summary.append(size)
+	for size, count in summary.items():
+		counts.append(count)
 		headers.append(str(size)+'-letter')
-	display(pd.DataFrame([summary], columns=headers).style.hide_index())
+	display(pd.DataFrame([counts], columns=headers).style.hide_index())
 
-def today_words(db):
-	return random.sample(db.items(), TODAY_WORD_COUNT)
+def get_sample(db):
+	return random.sample(db.items(), SAMPLE_WORDS)
 
-def spell(db_file, today):
-	for word in today:
-		c_box = State(db_file, word)
-		c_box.start()
+def spell(db_file, sample):
+	for word in sample:
+		check_box = State(db_file, word)
+		check_box.start()
 
 def db_connect(db_file):
 	db_handle = None
@@ -164,14 +158,14 @@ def db_table_create(db_handle):
 	except Error as e:
 		print(e)
 
-def db_insert_row(db_handle, word):
+def db_insert_row(db_handle, word_def):
 	sql = 'INSERT INTO words(word, def) VALUES(?, ?)'
 	try:
-		c = db_handle.cursor()
-		c.execute(sql, word)
+		curs = db_handle.cursor()
+		curs.execute(sql, word_def)
 	except Error as e:
 		print(e)
-	return c.lastrowid
+	return curs.lastrowid # usage?
 
 def db_load(db_handle):
 	try:
@@ -195,7 +189,7 @@ if __name__ == '__main__':
 	cache = {}
 	info = {}
 
-	if col:
+	if col: # empty database
 		info, count = analyze_collection(col, info, count, cache)
 		cache = dict(col)
 	else:
@@ -204,14 +198,17 @@ if __name__ == '__main__':
 		info, count = analyze_collection(col, info, count, cache)
 		cache = store_collection(col, cache, db_handle)
 
-		col = extract_excel(EXCEL)
+		# Fetch words from excel sheets
+		col = fetch_excels(excel_files)
+		# col may contain duplicates
 		info, count = analyze_collection(col, info, count, cache)
+		# cache should not have duplicate
 		cache = store_collection(col, cache, db_handle)
 
 	db_handle.commit()
 	db_handle.close()
 
-	display_info(info, count)
-	today = today_words(cache)
+	display_summary(info, count)
+	today = get_sample(cache)
 	spell(DBASE_FILE, today)
 
