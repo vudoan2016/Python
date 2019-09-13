@@ -1,10 +1,10 @@
 import sys
 import requests
 import pandas as pd
-import re
 import random
 import logging
 import sqlite3
+import time
 from sqlite3 import Error
 import ipywidgets as widgets
 from IPython.display import display, HTML
@@ -12,9 +12,8 @@ from IPython.core.interactiveshell import InteractiveShell
 from bs4 import BeautifulSoup
 from ipywidgets import HBox, Label
 
-HTML('<style> .widget-hbox .widget-label { max-width:350ex; text-align:left} </style>')
-
 SAMPLE_WORDS = 10
+PASS = 3 # after spelled correctly x times
 LOG_FILENAME = 'spelling.log'
 DBASE_FILE = 'word_db.db'
 excel_files = ['spelling_bee_list_grade_6.xlsx',
@@ -25,41 +24,7 @@ spelling_bee_urls = ['http://www2.sharonherald.com/herald/nie/spellb/spelllist1.
 										 'http://www2.sharonherald.com/herald/nie/spellb/spelllist2.html',
 										 'http://www2.sharonherald.com/herald/nie/spellb/spelllist3.html']
 
-InteractiveShell.ast_node_interactivity = "all"
-pd.set_option('display.max_columns', None)
-pd.set_option('display.expand_frame_repr', False)
-pd.set_option('max_colwidth', -1)
-
-logging.basicConfig(filename=LOG_FILENAME, level=logging.DEBUG)
-
-def get_book(url, count):
-	words = []
-
-	page = requests.get(url)
-	beginning = False
-	for line in page.text.splitlines():
-		line = line.strip()
-		if line:
-			if line == 'CHAPTER I.':
-				beginning = True
-
-			if not beginning:
-				continue
-
-			if 'THE END.' in line:
-				break
-
-			for word in re.split(';| |\.|,|--|"|_|\'|\?|\)|:|\(|\!|]', line):
-				#w = word.translate(str.maketrans('', '', string.punctuation))
-				w = word.strip().lower()
-				if '-' not in w and len(w) > 4 and not w.isnumeric() and (w, '') not in words:
-					words.append((w, ''))
-					count += 1
-				'''
-				if w not in ignores:
-					words.append(w)
-				'''
-	return words, count
+logging.basicConfig(filename=LOG_FILENAME, level=logging.DEBUG, format='%(message)s')
 
 class State:
 	def __init__(self, db_file, word):
@@ -69,13 +34,19 @@ class State:
 
 	def action(self, change):
 		if self.c_box.value:
-			sql = 'DELETE FROM words WHERE word=?'
 			try:
 				db_handle = db_connect(self.db_file)
-				curs = db_handle.cursor()
-				curs.execute(sql, (self.word[0],))
-				db_handle.commit()
-				db_handle.close()
+				if db_handle:
+					curs = db_handle.cursor()
+					curs.execute('SELECT * FROM words WHERE word=?', (self.word[0],))
+					row = curs.fetchone()
+					if row[2] == PASS-1: # delete row from database
+						curs.execute('DELETE FROM words WHERE word=?', (self.word[0],))
+					else:
+						curs.execute('UPDATE words SET def = ?, correct_spell = ? WHERE word = ?',
+									 (row[1], row[2]+1, self.word[0]))
+					db_handle.commit()
+					db_handle.close()
 			except Error as e:
 				print(e)
 
@@ -89,10 +60,10 @@ def fetch_excels(files):
 		df = pd.read_excel(f, sheet_name='Table 1')
 		for index, row in df.iterrows():
 			if 'Unnamed: 1' in df:
-				col.append((row['Unnamed: 0'].split()[0].lower(), row['Unnamed: 1']))
+				col.append((row['Unnamed: 0'].split()[0].lower(), row['Unnamed: 1'], 0))
 			else:
 				entry = row['Unnamed: 0'].replace('\n', '. ').split(':')
-				col.append((entry[0].split()[0], entry[1]))
+				col.append((entry[0].split()[0], entry[1], 0))
 	return col
 
 def scrape_pages(urls):
@@ -101,8 +72,7 @@ def scrape_pages(urls):
 		page = requests.get(url)
 		soup = BeautifulSoup(page.text, 'html.parser')
 		table = soup.find_all('table')[1] # words are in 2nd table
-		for row in table.find_all('b'):
-			col.append((row.contents[0].lower(), row.next_sibling))
+		col.extend([(row.contents[0].lower(), row.next_sibling, 0) for row in table.find_all('b')])
 	return col
 
 # print(sorted(list(frequency.items()), key=lambda tup: tup[1], reverse=True)[:20])
@@ -118,11 +88,12 @@ def analyze_collection(col, summary, count, cache):
 	return summary, count
 
 # Store the collection of word-defs in the cache & database
-def store_collection(col, cache, db_handle):
+def store_collection(col, cache, db_handle=None):
 	for word_def in col:
 		if word_def[0] not in cache.keys():
 			cache[word_def[0]] = word_def[1]
-			db_insert_row(db_handle, word_def)
+			if db_handle:
+				db_insert_row(db_handle, word_def)
 
 	return cache
 
@@ -154,12 +125,12 @@ def db_connect(db_file):
 def db_table_create(db_handle):
 	try:
 		cursor = db_handle.cursor()
-		cursor.execute('CREATE TABLE IF NOT EXISTS words (word text, def text)')
+		cursor.execute('CREATE TABLE IF NOT EXISTS words (word text, def text, correct_spell)')
 	except Error as e:
 		print(e)
 
 def db_insert_row(db_handle, word_def):
-	sql = 'INSERT INTO words(word, def) VALUES(?, ?)'
+	sql = 'INSERT INTO words(word, def, correct_spell) VALUES(?, ?, ?)'
 	try:
 		curs = db_handle.cursor()
 		curs.execute(sql, word_def)
@@ -189,17 +160,21 @@ if __name__ == '__main__':
 	cache = {}
 	info = {}
 
-	if col: # empty database
+	if col:
 		info, count = analyze_collection(col, info, count, cache)
-		cache = dict(col)
-	else:
+		cache = store_collection(col, cache)
+	else: # empty database
 		# Scrape web pages if database doesn't exist
+		start = time.time()
 		col = scrape_pages(spelling_bee_urls)
+		logging.debug('Scraping takes %s secs', str(time.time()-start))
 		info, count = analyze_collection(col, info, count, cache)
 		cache = store_collection(col, cache, db_handle)
 
 		# Fetch words from excel sheets
+		start = time.time()
 		col = fetch_excels(excel_files)
+		logging.debug('Fetching files takes %s secs', str(time.time()-start))
 		# col may contain duplicates
 		info, count = analyze_collection(col, info, count, cache)
 		# cache should not have duplicate
@@ -211,4 +186,3 @@ if __name__ == '__main__':
 	display_summary(info, count)
 	today = get_sample(cache)
 	spell(DBASE_FILE, today)
-
